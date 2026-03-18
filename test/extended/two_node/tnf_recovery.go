@@ -16,6 +16,8 @@ import (
 	"github.com/openshift/origin/test/extended/two_node/utils/core"
 	"github.com/openshift/origin/test/extended/two_node/utils/services"
 	exutil "github.com/openshift/origin/test/extended/util"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/kubernetes/test/e2e/framework"
 )
@@ -50,6 +52,53 @@ func computeLogInterval(pollInterval time.Duration) int {
 type hypervisorExtendedConfig struct {
 	HypervisorConfig         core.SSHConfig
 	HypervisorKnownHostsPath string
+}
+
+// reusableEtcdConn manages an etcd client connection that persists across poll iterations.
+// Creating a new etcd client per poll is expensive (spawns oc port-forward, fetches TLS certs
+// from kube-apiserver). Reusing the connection avoids redundant kube-apiserver calls, which is
+// critical during etcd recovery when kube-apiserver itself depends on etcd availability.
+// The connection is automatically recreated on network errors (e.g., port-forward target pod restart).
+type reusableEtcdConn struct {
+	factory helpers.EtcdClientCreator
+	client  *clientv3.Client
+	closeFn func()
+}
+
+func newReusableEtcdConn(factory helpers.EtcdClientCreator) *reusableEtcdConn {
+	return &reusableEtcdConn{factory: factory}
+}
+
+// memberList returns the etcd member list, creating a client connection if needed.
+// On network errors, the connection is closed and will be recreated on the next call.
+func (c *reusableEtcdConn) memberList() ([]*etcdserverpb.Member, error) {
+	if c.client == nil {
+		client, closeFn, err := c.factory.NewEtcdClient()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create etcd client: %w", err)
+		}
+		c.client = client
+		c.closeFn = closeFn
+	}
+
+	ctx, cancel := context.WithTimeout(context.TODO(), 15*time.Second)
+	defer cancel()
+	m, err := c.client.MemberList(ctx)
+	if err != nil {
+		if services.ClassifyEtcdError(err) == services.EtcdErrorNetwork {
+			c.close()
+		}
+		return nil, fmt.Errorf("failed to get member list: %w", err)
+	}
+	return m.Members, nil
+}
+
+func (c *reusableEtcdConn) close() {
+	if c.closeFn != nil {
+		c.closeFn()
+		c.closeFn = nil
+	}
+	c.client = nil
 }
 
 var _ = g.Describe("[sig-etcd][apigroup:config.openshift.io][OCPFeatureGate:DualReplica][Suite:openshift/two-node][Serial][Disruptive] Two Node with Fencing etcd recovery", func() {
@@ -415,6 +464,9 @@ func validateEtcdRecoveryState(
 	isTargetNodeStartedExpected, isTargetNodeLearnerExpected bool,
 	timeout, pollInterval time.Duration,
 ) {
+	conn := newReusableEtcdConn(e)
+	defer conn.close()
+
 	attemptCount := 0
 	lastLoggedAttempt := 0
 	logEveryNAttempts := computeLogInterval(pollInterval)
@@ -423,7 +475,7 @@ func validateEtcdRecoveryState(
 		attemptCount++
 		shouldLog := attemptCount == 1 || (attemptCount-lastLoggedAttempt) >= logEveryNAttempts
 
-		members, err := utils.GetMembers(e)
+		members, err := conn.memberList()
 		if err != nil {
 			if shouldLog {
 				g.GinkgoT().Logf("[Attempt %d] Failed to get etcd members: %v", attemptCount, err)
@@ -522,6 +574,9 @@ func validateEtcdRecoveryStateWithoutAssumingLeader(
 	nodeA, nodeB *corev1.Node,
 	timeout, pollInterval time.Duration,
 ) (leaderNode, learnerNode *corev1.Node, learnerStarted bool) {
+	conn := newReusableEtcdConn(e)
+	defer conn.close()
+
 	attemptCount := 0
 	lastLoggedAttempt := 0
 	logEveryNAttempts := computeLogInterval(pollInterval)
@@ -530,7 +585,7 @@ func validateEtcdRecoveryStateWithoutAssumingLeader(
 		attemptCount++
 		shouldLog := attemptCount == 1 || (attemptCount-lastLoggedAttempt) >= logEveryNAttempts
 
-		members, err := utils.GetMembers(e)
+		members, err := conn.memberList()
 		if err != nil {
 			if shouldLog {
 				g.GinkgoT().Logf("[Attempt %d] Failed to get etcd members: %v", attemptCount, err)

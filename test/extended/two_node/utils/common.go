@@ -275,11 +275,13 @@ func IsNodeReady(oc *exutil.CLI, nodeName string) bool {
 //	// ... trigger reboot ...
 //	if rebooted, err := HasNodeRebooted(oc, nodeSnapshot); rebooted { /* node rebooted */ }
 func HasNodeRebooted(oc *exutil.CLI, node *corev1.Node) (bool, error) {
-	if n, err := oc.AdminKubeClient().CoreV1().Nodes().Get(context.Background(), node.Name, metav1.GetOptions{}); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	n, err := oc.AdminKubeClient().CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+	if err != nil {
 		return false, err
-	} else {
-		return n.Status.NodeInfo.BootID != node.Status.NodeInfo.BootID, nil
 	}
+	return n.Status.NodeInfo.BootID != node.Status.NodeInfo.BootID, nil
 }
 
 // IsAPIResponding checks if the Kubernetes API server is responding to requests.
